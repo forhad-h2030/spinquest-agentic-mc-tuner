@@ -1,0 +1,13 @@
+# ROOT output files (large, generated)
+tuning/data/*.root
+
+# Logs
+*.log
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Overlay plots (regenerate with overlay.py)
+tuning/overlay_plots_*/
