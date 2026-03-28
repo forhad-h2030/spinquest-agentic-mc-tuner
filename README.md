@@ -8,8 +8,7 @@ An agentic AI system that autonomously tunes Monte Carlo combinatoric background
 
 | Metric | Value |
 |--------|-------|
-| KS statistic (full mass range) | **0.043** |
-| KS statistic (low-mass [1.5–2.5] GeV/c²) | **0.044** |
+| KS statistic | **0.043** |
 | MC events processed | 17.5 million |
 | Accepted events | 804,708 (4.6%) |
 | Phase 1 runtime | ~32 min (one-time) |
@@ -30,7 +29,7 @@ The Ollama llama3 agent runs a **ReAct (Reason + Act)** loop, calling tools via 
 get_params → run_tuning → compute_ks → set_param → run_tuning → ...
 ```
 
-The agent explores RATIO_CLIP_MAX, BDT_N_ESTIMATORS, BDT_LEARNING_RATE, EPOCHS, and ML cuts, tracking the best KS statistic in the low-mass region.
+The agent explores RATIO_CLIP_MAX, BDT_N_ESTIMATORS, BDT_LEARNING_RATE, EPOCHS, and ML cuts, tracking the KS statistic between tuned MC and classified experimental background.
 
 ### Two-Phase Tuner (discovered through agent exploration)
 
@@ -54,7 +53,7 @@ Phase 1 is cached to disk — subsequent runs skip it and go straight to Phase 2
 - **GBReweighter** (hep_ml) corrects the 1D mass shape
 - **Asymmetric BDT training**: 100k MC vs all ~950 EXP events — forcing equal sample sizes collapses performance when EXP statistics are limited
 - **Midpoint bisection**: bdt_clip search starts at the midpoint of [0.5, 5.0]; starting at the edge caused the optimizer to miss the global minimum
-- **Full mass range [1.5, 6.0] GeV** for flow training — narrowing to [1.5, 2.5] left too few EXP events and degraded NF quality
+- **Full mass range [1.5, 6.0] GeV** for flow training — a narrower window left too few EXP events and degraded NF quality
 
 ---
 
@@ -134,4 +133,4 @@ Event selection: ML-based J/ψ, ψ' and Drell-Yan vetoes, vertex z > −600 cm, 
 
 ## Physics Context
 
-The SpinQuest experiment measures the Drell-Yan process to extract the sea quark spin asymmetry. The combinatoric background — random muon track combinations mimicking a dimuon signal — must be modelled accurately from MC simulation. This tuner reweights the MC momentum and mass distributions to match data, enabling a data-driven background subtraction in the low-mass region below the J/ψ peak (1.5–2.5 GeV/c²).
+The SpinQuest experiment measures the Drell-Yan process to extract the sea quark spin asymmetry. The combinatoric background — random muon track combinations mimicking a dimuon signal — must be accurately modelled from MC simulation. This tuner reweights the MC momentum and mass shapes to match classified experimental background data, producing tuned combinatoric distributions for use in the analysis.
