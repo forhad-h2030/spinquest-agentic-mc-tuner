@@ -1,10 +1,4 @@
-#!/usr/bin/env python3
-"""
-rej.py — 6-D momentum NF reweighting + BDT mass-ratio adaptive rejection sampling
-for SpinQuest combinatoric background tuning. Minimises KS(exp_mass, sim_mass).
-"""
 import time
-import shutil
 import numpy as np
 import torch
 import torch.nn as nn
@@ -16,21 +10,31 @@ from hep_ml import reweight as hep_reweight
 from tqdm import tqdm
 import ROOT
 
-MODE = "comb"
+# =========================================================
+#   MODE SELECTION: "jpsi", "psip", "dy", or "comb"
+# =========================================================
+MODE = "comb"   # <-- change to "psip", "dy", or "comb" as needed
 
 assert MODE in ("jpsi", "psip", "dy", "comb"), \
     f"MODE must be 'jpsi', 'psip', 'dy', or 'comb', got '{MODE}'"
 
+# =========================================================
+#   REWEIGHTING: 6-D momentum NF, trained once and frozen.
+#   Mass-ratio weight w_mass(m) is estimated from a KDE on
+#   the last accepted SIM mass sample and updated each iter.
+#   ratio_clip_max is bisected to minimise the KS statistic
+#   KS(exp_mass, resampled_sim_mass).
+# =========================================================
 ACTIVE_VARS = [
     "rec_dimu_mu_pos_px", "rec_dimu_mu_pos_py", "rec_dimu_mu_pos_pz",
     "rec_dimu_mu_neg_px", "rec_dimu_mu_neg_py", "rec_dimu_mu_neg_pz",
 ]
 
 SIM_FILES = {
-    "jpsi": "data/jpsi/raw_mc_jpsi_target_pythia8.root",
-    "psip": "data/psip/raw_mc_psip_target_pythia8.root",
-    "dy":   "dy/dy.root",
-    "comb": "/Users/spin/CombBkgDNP/comb/data/mc_comb_muon_gun_march19.root",
+    "jpsi": "/Users/spin/CombBkgDNP/comb/data/jpsi/raw_mc_jpsi_target_pythia8.root",
+    "psip": "/Users/spin/CombBkgDNP/comb/data/psip/raw_mc_psip_target_pythia8.root",
+    "dy":   "/Users/spin/CombBkgDNP/comb/dy/dy.root",
+    "comb": "/Users/spin/CombBkgDNP/comb/data/out_test_comb.root",
 }
 SIM_FILE  = SIM_FILES[MODE]
 #EXP_FILE  = "/Users/spin/spinquest-combinatoric-bkg/data/raw_input/exp_tagged_tgt_data.root"
@@ -40,6 +44,7 @@ INPUT_FILE  = SIM_FILE
 OUTPUT_FILE = f"data/out_test_{MODE}_momentum_adaptive.root"
 TREE_NAME   = "tree"
 
+# ML probability cut thresholds
 ML_JPSI_CUT    = 0.8
 ML_PSIP_CUT    = 0.8
 ML_DY_COMB_CUT = 0.8
@@ -65,19 +70,21 @@ MOMENTUM_RANGES = {
 
 CLIP_ZSCORE      = 15.0
 BATCH_SIZE_TRAIN = 1000
-EPOCHS_EXP       = 700
-EPOCHS_SIM       = 700
+EPOCHS_EXP       = 300
+EPOCHS_SIM       = 300
 LR               = 1e-4
 BATCH_SIZE_RS    = 1_000
 
-RATIO_CLIP_INIT      = 5.0
-RATIO_CLIP_MIN       = 3.0
-RATIO_CLIP_MAX_CAP   = 15.0
-ADAPTIVE_MAX_ITER    = 5
-ADAPTIVE_TOL         = 1e-4
-BDT_N_ESTIMATORS     = 300
+# =========================================================
+#   RS settings  (adaptive scanning disabled)
+#   ratio_clip_max is fixed at the optimum value of 5.0.
+#   BDT / KDE mass weighter is still available for a single
+#   pass but the outer bisection loop is not used.
+# =========================================================
+RATIO_CLIP_MAX       = 15.0    # fixed optimum — no bisection
+BDT_N_ESTIMATORS     = 250    # GBReweighter trees for mass reweighting
 BDT_LEARNING_RATE    = 0.1
-MASS_WEIGHT_CAP      = 10.0
+MASS_WEIGHT_CAP      = 7.0   # hard cap on w_mass to prevent outliers
 
 ADD_TRAIN_NOISE   = False
 TRAIN_NOISE_SIGMA = 0.01
@@ -87,7 +94,9 @@ torch.manual_seed(SEED)
 np.random.seed(SEED)
 
 
-
+# =========================================================
+#                   Normalizing Flow
+# =========================================================
 class AffineCoupling(nn.Module):
     def __init__(self, dim, hidden_dim=64):
         super().__init__()
@@ -173,11 +182,21 @@ def train_flow(model, base_dist, data_tensor, epochs, batch_size, lr):
         optimizer.step()
 
 
-
+# =========================================================
+#   BDTMassWeighter
+#
+#   Uses hep_ml GBReweighter (same as reweight.py) to learn
+#   w_mass(m) = p_exp(m) / p_sim(m) from 1-D mass arrays.
+#
+#   Call update(sim_mass) at the start of each adaptive
+#   iteration to retrain the BDT on the latest accepted SIM
+#   mass sample.  predict() can then be called batch-wise
+#   during streaming RS without reloading the full file.
+# =========================================================
 class BDTMassWeighter:
     def __init__(self, exp_mass: np.ndarray):
         self._exp_mass  = np.clip(exp_mass, MASS_MIN, MASS_MAX).reshape(-1, 1)
-        self._reweighter = None
+        self._reweighter = None   # set by first call to update()
         self.weight_cap  = MASS_WEIGHT_CAP
 
     def update(self, sim_mass: np.ndarray):
@@ -188,6 +207,7 @@ class BDTMassWeighter:
             return
         sim_clipped = np.clip(sim_mass, MASS_MIN, MASS_MAX).reshape(-1, 1)
 
+        # Subsample to keep training fast if one side is huge
         n = min(len(sim_clipped), len(self._exp_mass))
         rng = np.random.default_rng(SEED)
         sim_idx = rng.choice(len(sim_clipped), n, replace=False)
@@ -220,7 +240,9 @@ class BDTMassWeighter:
         return w.astype(np.float32)
 
 
-
+# =========================================================
+#            Data loading & preprocessing helpers
+# =========================================================
 def apply_cuts_exp(data_dict):
     if MODE == "jpsi":
         ml_mask = (data_dict["ml_p_jpsi"] > ML_JPSI_CUT)
@@ -368,15 +390,34 @@ def _exp_cut_description():
             f"&& ML_PSIP < {ML_PSIP_CUT}, mass [{MASS_MIN},{MASS_MAX}], vz > {VZ_MIN}")
 
 
-
+# =========================================================
+#   KS statistic  KS(exp_mass, sim_mass)
+#   Lower = better.  Replaces KL as optimisation target.
+#   Using scipy two-sample KS: does not require binning,
+#   is sensitive to shape differences anywhere in the CDF,
+#   and is well-defined even with small samples.
+# =========================================================
 def compute_mass_ks(exp_mass: np.ndarray, sim_mass: np.ndarray) -> float:
     if len(sim_mass) < 2:
-        return 1.0
+        return 1.0   # worst possible score if no events accepted
     ks_stat, _ = ks_2samp(exp_mass, sim_mass)
     return float(ks_stat)
 
 
-
+# =========================================================
+#   Streaming rejection sampling
+#
+#   Acceptance probability:
+#       p(x) = clip( r_momentum(x) * w_mass(m(x)) / M, 0, 1 )
+#
+#   where:
+#     r_momentum = exp( log p_exp(x) - log p_sim(x) )  [NF ratio]
+#     w_mass(m)  = p_exp(m) / p_sim(m)                 [KDE ratio]
+#     M          = ratio_clip_max  (normalisation constant)
+#
+#   mass_weighter may be None on the first iteration (before
+#   any accepted sample exists), in which case w_mass = 1.
+# =========================================================
 @torch.no_grad()
 def rejection_sampling_streaming(
     input_file,
@@ -442,17 +483,20 @@ def rejection_sampling_streaming(
         scaled = np.clip(scaled, -CLIP_ZSCORE, CLIP_ZSCORE)
         xb     = torch.tensor(scaled, dtype=torch.float32, device=device)
 
+        # --- momentum density ratio ---
         exp_lp = exp_model.log_prob(xb, base_dist)
         sim_lp = sim_model.log_prob(xb, base_dist)
         r_mom  = torch.exp(torch.clamp(exp_lp - sim_lp, min=-50.0, max=50.0))
         r_mom  = torch.clamp(r_mom, max=ratio_clip_max).cpu().numpy()
 
+        # --- mass ratio weight (updated each iteration) ---
         if mass_weighter is not None:
             batch_mass = arrays["mass"][cut_mask]
             w_mass     = mass_weighter.weights(batch_mass)
         else:
             w_mass = np.ones(r_mom.shape[0], dtype=np.float32)
 
+        # --- combined acceptance probability ---
         combined = r_mom * w_mass
         probs    = np.clip(combined / M, 0.0, 1.0)
 
@@ -489,110 +533,71 @@ def rejection_sampling_streaming(
     return n_acc_total, accepted_mass
 
 
-
-def adaptive_rs_loop(exp_mass, exp_model, sim_model, base_dist, scaler):
+# =========================================================
+#   Single-pass RS  (adaptive scanning disabled)
+#
+#   ratio_clip_max is fixed at RATIO_CLIP_MAX = 5.0 (optimum).
+#   One RS pass is run; mass KS is reported for reference only.
+#
+#   Original adaptive loop removed. Previous behaviour summary:
+#     1. Update w_mass KDE from the previous accepted sample
+#
+#   Converges when delta_KS < ADAPTIVE_TOL or the bisection
+#   interval collapses below 0.05.
+# =========================================================
+def run_fixed_rs(exp_mass, sim_mass, exp_model, sim_model, base_dist, scaler):
+    """Single-pass RS with fixed ratio_clip_max. Adaptive scanning is OFF.
+    BDT mass reweighting is enabled for dy/comb modes only, seeded with
+    raw SIM mass (after kinematic cuts) vs EXP mass."""
     print("\n" + "=" * 60)
-    print("  Adaptive RS: mass KDE ratio + KS minimisation")
-    print(f"  Search range : [{RATIO_CLIP_MIN}, {RATIO_CLIP_MAX_CAP}]")
-    print(f"  Max iters    : {ADAPTIVE_MAX_ITER}    tol: {ADAPTIVE_TOL}")
+    print("  Fixed RS  (adaptive scanning OFF)")
+    print(f"  ratio_clip_max = {RATIO_CLIP_MAX:.4f}  [fixed optimum]")
     print(f"  Mass weight cap : {MASS_WEIGHT_CAP}")
-    print(f"  BDT estimators  : {BDT_N_ESTIMATORS}  lr: {BDT_LEARNING_RATE}")
+
+    # Train BDT mass weighter on raw SIM mass vs EXP mass — dy/comb only
+    if MODE in ("dy", "comb"):
+        print(f"  Mass reweighting : ON  (BDT, mode={MODE})")
+        print(f"  BDT seed: {len(sim_mass):,} SIM vs {len(exp_mass):,} EXP mass events")
+        mass_weighter = BDTMassWeighter(exp_mass)
+        mass_weighter.update(sim_mass)   # proper fit: SIM mass -> EXP mass
+    else:
+        print(f"  Mass reweighting : OFF  (mode={MODE})")
+        mass_weighter = None
     print("=" * 60)
 
-    clip_lo  = RATIO_CLIP_MIN
-    clip_hi  = RATIO_CLIP_MAX_CAP
-    clip_cur = RATIO_CLIP_INIT
+    n_acc, sim_mass = rejection_sampling_streaming(
+        input_file     = INPUT_FILE,
+        output_file    = OUTPUT_FILE,
+        tree_name      = TREE_NAME,
+        exp_model      = exp_model,
+        sim_model      = sim_model,
+        base_dist      = base_dist,
+        scaler         = scaler,
+        ratio_clip_max = RATIO_CLIP_MAX,
+        mass_weighter  = mass_weighter,
+        batch_size     = BATCH_SIZE_RS,
+    )
 
-    best_ks   = float("inf")
-    best_clip = clip_cur
-    best_file = OUTPUT_FILE
-    history   = []
-
-    mass_weighter = BDTMassWeighter(exp_mass)
-    prev_sim_mass = None
-
-    for iteration in range(1, ADAPTIVE_MAX_ITER + 1):
-        iter_file = OUTPUT_FILE.replace(".root", f"_clip{clip_cur:.3f}.root")
-
-        print(f"\n[Iter {iteration}/{ADAPTIVE_MAX_ITER}]  "
-              f"ratio_clip_max = {clip_cur:.4f}  "
-              f"search [{clip_lo:.3f}, {clip_hi:.3f}]")
-
-        if prev_sim_mass is not None and len(prev_sim_mass) >= 10:
-            mass_weighter.update(prev_sim_mass)
-            mw_active = mass_weighter
-        else:
-            print("[Iter] No prior accepted sample — running without mass weight.")
-            mw_active = None
-
-        n_acc, sim_mass = rejection_sampling_streaming(
-            input_file     = INPUT_FILE,
-            output_file    = iter_file,
-            tree_name      = TREE_NAME,
-            exp_model      = exp_model,
-            sim_model      = sim_model,
-            base_dist      = base_dist,
-            scaler         = scaler,
-            ratio_clip_max = clip_cur,
-            mass_weighter  = mw_active,
-            batch_size     = BATCH_SIZE_RS,
-        )
-
-        if n_acc < 10:
-            print(f"  Too few accepted events ({n_acc}) — raising clip.")
-            clip_lo  = clip_cur
-            clip_cur = min((clip_cur + clip_hi) / 2.0, RATIO_CLIP_MAX_CAP)
-            continue
-
-        prev_sim_mass = sim_mass
-
-        ks = compute_mass_ks(exp_mass, sim_mass)
-        history.append((clip_cur, ks, n_acc))
-        print(f"  Mass KS = {ks:.6f}   n_acc = {n_acc:,}")
-
-        if ks < best_ks - ADAPTIVE_TOL:
-            best_ks   = ks
-            best_clip = clip_cur
-            best_file = iter_file
-            print(f"  ✓ New best  KS={best_ks:.6f}  clip={best_clip:.4f}")
-        else:
-            print(f"  No improvement  (best KS={best_ks:.6f} @ clip={best_clip:.4f})")
-
-        if len(history) >= 2 and ks < history[-2][1]:
-            clip_lo  = clip_cur
-            clip_cur = min(clip_cur * 1.5, clip_hi)
-        else:
-            clip_hi  = clip_cur
-            clip_cur = (clip_lo + clip_cur) / 2.0
-
-        if (clip_hi - clip_lo) < 0.05:
-            print(f"\n[Adaptive] Interval collapsed to "
-                  f"[{clip_lo:.3f}, {clip_hi:.3f}] — converged.")
-            break
+    ks = compute_mass_ks(exp_mass, sim_mass) if n_acc >= 2 else float("nan")
 
     print("\n" + "=" * 60)
-    print("  Adaptive search complete")
-    print(f"  Best ratio_clip_max : {best_clip:.4f}")
-    print(f"  Best mass KS        : {best_ks:.6f}")
-    print("  Full history (clip, KS, n_acc):")
-    for clip, ks, n in history:
-        marker = "  ← best" if abs(clip - best_clip) < 1e-6 else ""
-        print(f"    clip={clip:8.4f}  KS={ks:.6f}  n_acc={n:,}{marker}")
+    print("  RS complete")
+    print(f"  ratio_clip_max : {RATIO_CLIP_MAX:.4f}")
+    print(f"  Accepted events: {n_acc:,}")
+    print(f"  Mass KS        : {ks:.6f}")
     print("=" * 60)
 
-    if best_file != OUTPUT_FILE:
-        shutil.copy2(best_file, OUTPUT_FILE)
-        print(f"\nCopied best output → {OUTPUT_FILE}")
-
-    return best_clip, best_ks
+    return RATIO_CLIP_MAX, ks
 
 
-
+# =========================================================
+#                         Main
+# =========================================================
 def main():
     print(f"=== Running in MODE = '{MODE}' ===")
     print(f"  Stage 1 : 6-D momentum NF (train once, freeze)")
-    print(f"  Stage 2 : adaptive RS with mass KDE ratio weight "
-          f"(minimise KS distance)")
+    print(f"  Stage 2 : fixed RS  ratio_clip_max={RATIO_CLIP_MAX}  "
+          f"(adaptive scanning OFF)")
     print(f"  EXP cuts: {_exp_cut_description()}")
     print(f"  Output  : {OUTPUT_FILE}\n")
 
@@ -600,6 +605,9 @@ def main():
     n_sim_total = count_entries(SIM_FILE, TREE_NAME)
     print(f"EXP total: {n_exp_total:,}   SIM total: {n_sim_total:,}")
 
+    # ----------------------------------------------------------
+    # STEP 1 — Load training data (6-D momentum, after cuts)
+    # ----------------------------------------------------------
     print("\n=== STEP 1: Load training data ===")
     exp_points = load_first_n_flat(EXP_FILE, TREE_NAME, ALL_VARS,
                                    n_exp_total, cut_type='exp')
@@ -609,6 +617,9 @@ def main():
                                     seed=SEED, cut_type='sim')
     print(f"EXP train: {exp_points.shape}   SIM train: {sim_points.shape}")
 
+    # ----------------------------------------------------------
+    # STEP 2 — Scaler (fit on EXP, apply to both)
+    # ----------------------------------------------------------
     print("\n=== STEP 2: Fit scaler ===")
     exp_scaled, sim_scaled, scaler = fit_scaler_on_exp_and_transform(
         exp_points, sim_points)
@@ -618,6 +629,9 @@ def main():
     dim       = len(ACTIVE_VARS)
     base_dist = make_base_dist(dim, device=device)
 
+    # ----------------------------------------------------------
+    # STEP 3-5 — Build & train flows (trained once, then frozen)
+    # ----------------------------------------------------------
     print(f"\n=== STEP 3: Build {dim}-D flow models ===")
     exp_model = FlowModel(dim, num_layers=6, hidden_dim=64).to(device)
     sim_model = FlowModel(dim, num_layers=6, hidden_dim=64).to(device)
@@ -633,6 +647,9 @@ def main():
     exp_model.eval()
     sim_model.eval()
 
+    # ----------------------------------------------------------
+    # STEP 6 — Load EXP mass for KS evaluation
+    # ----------------------------------------------------------
     print("\n=== STEP 6: Load EXP mass for KS evaluation ===")
     with uproot.open(EXP_FILE) as f:
         exp_arr = f[TREE_NAME].arrays(
@@ -641,9 +658,20 @@ def main():
     exp_mass_vals = exp_arr["mass"][apply_cuts_exp(exp_arr)]
     print(f"  EXP mass events for KS: {len(exp_mass_vals):,}")
 
-    print("\n=== STEP 7: Adaptive rejection sampling (mass KDE + KS) ===")
-    best_clip, best_ks = adaptive_rs_loop(
+    with uproot.open(SIM_FILE) as f:
+        sim_arr = f[TREE_NAME].arrays(
+            list(set(CUT_VARS_SIM + ["mass"])),
+            library="np", entry_stop=n_sim_total)
+    sim_mass_vals = sim_arr["mass"][apply_cuts_sim(sim_arr)]
+    print(f"  SIM mass events for BDT seed: {len(sim_mass_vals):,}")
+
+    # ----------------------------------------------------------
+    # STEP 7 — Fixed RS: single pass with ratio_clip_max = 5.0
+    # ----------------------------------------------------------
+    print("\n=== STEP 7: Fixed rejection sampling (adaptive scanning OFF) ===")
+    best_clip, best_ks = run_fixed_rs(
         exp_mass  = exp_mass_vals,
+        sim_mass  = sim_mass_vals,
         exp_model = exp_model,
         sim_model = sim_model,
         base_dist = base_dist,
@@ -651,9 +679,9 @@ def main():
     )
 
     print(f"\nAll steps completed.")
-    print(f"  Final ratio_clip_max : {best_clip:.4f}")
-    print(f"  Final mass KS        : {best_ks:.6f}")
-    print(f"  Output               : {OUTPUT_FILE}")
+    print(f"  ratio_clip_max : {best_clip:.4f}  [fixed]")
+    print(f"  Mass KS        : {best_ks:.6f}")
+    print(f"  Output         : {OUTPUT_FILE}")
 
 if __name__ == "__main__":
     main()
